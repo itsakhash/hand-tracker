@@ -13,6 +13,10 @@ pinch bar, and FPS.
 Keys: q = quit, c = clear drawing, s = save drawing as a transparent PNG
       in ./drawings/, [ and ] = thinner / thicker brush
 
+Speed options:
+  --width / --height   capture size (default 640x480; hand tracking does not need HD)
+  --profile            print where the time goes (ms per stage) every 2 seconds
+
 Setup:
   python3 -m venv .venv && source .venv/bin/activate
   pip install -r requirements.txt
@@ -27,6 +31,7 @@ If the wrong camera opens, run with --camera 1.
 import argparse
 import math
 import os
+import threading
 import time
 import urllib.request
 from collections import Counter, deque
@@ -160,6 +165,51 @@ class GestureSmoother:
         self.current = "NONE"
 
 
+class CameraStream:
+    """Reads the camera on a background thread so the main loop never waits on it.
+
+    The main loop asks for the newest frame it has not seen yet; if processing
+    is slower than the camera, older frames are dropped instead of piling up,
+    which keeps latency low.
+    """
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.lock = threading.Lock()
+        self.frame = None
+        self.frame_id = 0
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while self.running:
+            ok, frame = self.cap.read()
+            if not ok:
+                self.running = False
+                break
+            with self.lock:
+                self.frame = frame
+                self.frame_id += 1
+
+    def read(self, last_id=-1, timeout=5.0):
+        """Wait for a frame newer than last_id. Returns (ok, frame, frame_id)."""
+        deadline = time.time() + timeout
+        while True:
+            with self.lock:
+                if self.frame is not None and self.frame_id != last_id:
+                    return True, self.frame.copy(), self.frame_id
+                ended = not self.running
+            if ended or time.time() > deadline:
+                return False, None, last_id
+            time.sleep(0.001)
+
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=1.0)
+        self.cap.release()
+
+
 class DrawingCanvas:
     """A persistent drawing layer controlled by hand gestures."""
 
@@ -228,8 +278,9 @@ class DrawingCanvas:
             self.cursor = tuple(int(v) for v in tip)
             if gesture == "FIST":
                 palm = dist(pts[WRIST], pts[MIDDLE_MCP])
-                cx = sum(pts[i][0] for i in (WRIST, INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP)) / 5
-                cy = sum(pts[i][1] for i in (WRIST, INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP)) / 5
+                ids = (WRIST, INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP)
+                cx = sum(pts[i][0] for i in ids) / len(ids)
+                cy = sum(pts[i][1] for i in ids) / len(ids)
                 radius = max(10, int(ERASER_RATIO * palm))
                 center = (int(cx), int(cy))
                 cv2.circle(self.canvas, center, radius, (0, 0, 0), -1)
@@ -240,10 +291,18 @@ class DrawingCanvas:
 
         self.last_gesture = gesture
 
+    def mask(self):
+        """255 where something is drawn, 0 elsewhere (single channel)."""
+        gray = cv2.cvtColor(self.canvas, cv2.COLOR_BGR2GRAY)
+        return cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY)[1]
+
     def composite(self, frame):
-        """Paint the drawing onto the video frame (in place)."""
-        mask = self.canvas.any(axis=2)
-        frame[mask] = self.canvas[mask]
+        """Paint the drawing onto the video frame (in place).
+
+        cv2.copyTo with a mask is several times faster than NumPy boolean
+        indexing on full frames, which matters at video frame rates.
+        """
+        cv2.copyTo(self.canvas, self.mask(), frame)
 
     def draw_overlays(self, frame):
         """Hover cursor and eraser outline, drawn on the video frame."""
@@ -255,8 +314,7 @@ class DrawingCanvas:
     def save(self):
         """Save the drawing as a transparent PNG and return its path."""
         os.makedirs(DRAWINGS_DIR, exist_ok=True)
-        alpha = (self.canvas.any(axis=2) * 255).astype(np.uint8)
-        bgra = np.dstack([self.canvas, alpha])
+        bgra = np.dstack([self.canvas, self.mask()])
         path = os.path.join(DRAWINGS_DIR, time.strftime("drawing_%Y%m%d_%H%M%S.png"))
         cv2.imwrite(path, bgra)
         return path
@@ -273,6 +331,10 @@ def draw_hand(frame, pts):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=int, default=0)
+    ap.add_argument("--width", type=int, default=640)
+    ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--profile", action="store_true",
+                    help="print average ms per stage every 2 seconds")
     args = ap.parse_args()
 
     ensure_model()
@@ -280,8 +342,14 @@ def main():
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         raise SystemExit("Could not open the camera. Check permissions or try --camera 1.")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    print(f"Camera opened: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}, "
+          f"driver reports {cap.get(cv2.CAP_PROP_FPS):.0f} fps")
+    stream = CameraStream(cap)
 
     options = vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
@@ -299,16 +367,23 @@ def main():
     prev_t = time.time()
     start_t = prev_t
     last_ts = -1
+    last_id = -1
     fps = 0.0
     toast = ("", 0.0)  # (message, time it was set)
+    timing = {"read": 0.0, "detect": 0.0, "draw": 0.0, "show": 0.0}
+    timing_frames = 0
+    timing_since = time.time()
 
     while True:
-        ok, frame = cap.read()
+        t0 = time.perf_counter()
+        ok, frame, last_id = stream.read(last_id)
         if not ok:
+            print("Camera stopped delivering frames.")
             break
         frame = cv2.flip(frame, 1)  # mirror view feels natural
         h, w = frame.shape[:2]
         drawing.ensure(frame.shape)
+        t1 = time.perf_counter()
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -316,6 +391,7 @@ def main():
         ts = max(ts, last_ts + 1)  # timestamps must strictly increase
         last_ts = ts
         result = landmarker.detect_for_video(mp_image, ts)
+        t2 = time.perf_counter()
 
         pts = None
         gesture = "NONE"
@@ -376,9 +452,26 @@ def main():
         prev_t = now
         cv2.putText(frame, f"{fps:.0f} FPS", (w - 150, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        t3 = time.perf_counter()
 
         cv2.imshow("Hand tracker (q to quit)", frame)
         key = cv2.waitKey(1) & 0xFF
+        t4 = time.perf_counter()
+
+        if args.profile:
+            timing["read"] += t1 - t0
+            timing["detect"] += t2 - t1
+            timing["draw"] += t3 - t2
+            timing["show"] += t4 - t3
+            timing_frames += 1
+            if time.time() - timing_since >= 2.0:
+                n = max(timing_frames, 1)
+                print("ms/frame  " + "  ".join(f"{k}={v / n * 1000:.1f}" for k, v in timing.items())
+                      + f"  ({timing_frames / (time.time() - timing_since):.1f} fps)")
+                timing = {k: 0.0 for k in timing}
+                timing_frames = 0
+                timing_since = time.time()
+
         if key == ord("q"):
             break
         elif key == ord("c"):
@@ -393,7 +486,7 @@ def main():
             drawing.change_thickness(2)
 
     landmarker.close()
-    cap.release()
+    stream.stop()
     cv2.destroyAllWindows()
 
 
