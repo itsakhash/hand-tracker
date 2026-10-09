@@ -71,7 +71,7 @@ of random in-between hand shapes. Press `u` to throw away a bad take, `s` to sav
 - Low confidence (< 0.6) becomes `UNKNOWN`.
 - Try other models with `--kind forest|knn|mlp`.
 
-**Label spelling matters.** Drawing and mouse mode react to `OPEN PALM`, `FIST`, `POINT`, `PEACE`, `THUMBS UP`. Other labels show up on screen but trigger nothing.
+**Label spelling matters.** Drawing and mouse mode react to `OPEN PALM`, `FIST`, `POINT`, `PEACE`, `THUMBS UP`. `ROCK` and `UNKNOWN` show up on screen but trigger nothing.
 
 **Safety.** `.joblib` files are pickles - only load models you trained yourself.
 

@@ -1290,6 +1290,16 @@ class TestHandDetector(unittest.TestCase):
         self.assertTrue(fake.closed)
 
 
+class TestLabelsMatchTheRules(unittest.TestCase):
+    def test_every_gesture_the_rules_can_name_is_a_default_label(self):
+        import gesture_model
+        names = {ht.classify_gesture(build_hand(ext, thumb))
+                 for ext, thumb in [("", "tucked"), ("IMRP", "out"), ("I", "tucked"),
+                                    ("IM", "tucked"), ("", "up"), ("IP", "tucked")]}
+        self.assertEqual(names, {"FIST", "OPEN PALM", "POINT", "PEACE", "THUMBS UP", "ROCK"})
+        self.assertLessEqual(names, set(gesture_model.DEFAULT_LABELS))
+
+
 class TestOpenCamera(unittest.TestCase):
     def test_exits_with_a_hint_when_the_camera_will_not_open(self):
         cap = mock.Mock()

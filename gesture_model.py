@@ -34,7 +34,9 @@ MODEL_KINDS = ("forest", "knn", "mlp")
 
 # Gesture names the app reacts to. Your labels must use these exact spellings
 # for drawing and mouse mode to respond to the learned gestures.
-DEFAULT_LABELS = ["OPEN PALM", "FIST", "POINT", "PEACE", "THUMBS UP", "UNKNOWN"]
+# Keep UNKNOWN in slot 6 and add new gestures after it, so the number keys in
+# collect_gestures.py never change for gestures you already recorded.
+DEFAULT_LABELS = ["OPEN PALM", "FIST", "POINT", "PEACE", "THUMBS UP", "UNKNOWN", "ROCK"]
 
 
 # --------------------------------------------------------------------------

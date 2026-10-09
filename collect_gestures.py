@@ -20,7 +20,9 @@ Keys: 1-9 choose gesture | SPACE start/stop a take | u undo last take |
       s save to disk | q save and quit
 
 The labels must be spelled like the app's gestures (OPEN PALM, FIST, POINT, PEACE,
-THUMBS UP) for drawing and mouse mode to react to them. Use --labels to change the list.
+THUMBS UP) for drawing and mouse mode to react to them. ROCK (index + pinky up) is
+recognized and shown on screen but does not trigger anything yet. Use --labels to change
+the list.
 """
 import argparse
 import os

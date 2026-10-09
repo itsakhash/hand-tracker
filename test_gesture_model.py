@@ -26,6 +26,7 @@ POSES = {
     "POINT": ("I", "tucked"),
     "PEACE": ("IM", "tucked"),
     "THUMBS UP": ("", "up"),
+    "ROCK": ("IP", "tucked"),
 }
 
 
@@ -276,6 +277,17 @@ class TestAugment(unittest.TestCase):
     def test_no_copies_means_only_originals_and_mirrors(self):
         X, y = gm.augment(self.norm, self.labels, copies=0)
         self.assertEqual(len(X), 4)
+
+
+class TestDefaultLabels(unittest.TestCase):
+    def test_rock_is_included_and_old_key_numbers_are_unchanged(self):
+        labels = gm.DEFAULT_LABELS
+        self.assertEqual(labels[:6], ["OPEN PALM", "FIST", "POINT", "PEACE", "THUMBS UP", "UNKNOWN"])
+        self.assertEqual(labels[6], "ROCK")
+        self.assertLessEqual(len(labels), 9)   # chosen with number keys 1-9
+
+    def test_no_duplicates(self):
+        self.assertEqual(len(set(gm.DEFAULT_LABELS)), len(gm.DEFAULT_LABELS))
 
 
 class TestMetrics(unittest.TestCase):
