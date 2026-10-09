@@ -1,16 +1,17 @@
 """
-Hand tracker using your webcam (MediaPipe Tasks HandLandmarker + OpenCV).
+Hand tracker + air drawing canvas (MediaPipe Tasks HandLandmarker + OpenCV).
 
-Shows:
-  - the 21 hand landmarks and bones drawn on the live video
-  - a recognized gesture: FIST, OPEN PALM, POINT, PEACE, ROCK, THUMBS UP
-  - which fingers are detected as extended (T I M R P) -- handy for tuning
-  - finger count (0-5)
-  - pinch amount (thumb tip to index tip, normalized by hand size) as a bar
-  - a fading trail behind your index fingertip
-  - FPS
+Gestures:
+  POINT       draw with your index fingertip
+  OPEN PALM   move without drawing (a cursor shows where you are)
+  PEACE       switch to the next color
+  FIST        erase (an eraser circle follows your palm)
 
-Keys: q = quit, c = clear trail
+Also shown: recognized gesture, per-finger states (T I M R P), finger count,
+pinch bar, and FPS.
+
+Keys: q = quit, c = clear drawing, s = save drawing as a transparent PNG
+      in ./drawings/, [ and ] = thinner / thicker brush
 
 Setup:
   python3 -m venv .venv && source .venv/bin/activate
@@ -36,15 +37,17 @@ import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
+HERE = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(HERE, "hand_landmarker.task")
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
              "hand_landmarker/float16/latest/hand_landmarker.task")
+DRAWINGS_DIR = os.path.join(HERE, "drawings")
 
 # MediaPipe landmark indices
 WRIST, THUMB_IP, THUMB_TIP = 0, 3, 4
 INDEX_MCP, INDEX_PIP, INDEX_TIP = 5, 6, 8
 MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP = 9, 10, 12
-RING_PIP, RING_TIP = 14, 16
+RING_MCP, RING_PIP, RING_TIP = 13, 14, 16
 PINKY_MCP, PINKY_PIP, PINKY_TIP = 17, 18, 20
 
 # Which landmarks connect to which (the hand "skeleton")
@@ -62,6 +65,13 @@ THUMB_OUT_RATIO = 0.5    # thumb tip must be this many palm-lengths from the ind
 THUMB_UP_MARGIN = 0.3    # thumb tip must be this many palm-lengths above the index base
 SMOOTH_FRAMES = 7        # gesture is decided by a vote over this many frames
 MIN_VOTES = 4            # votes needed to switch to a new gesture
+
+# Drawing settings
+COLORS = [("CYAN", (255, 255, 0)), ("GREEN", (0, 255, 0)), ("MAGENTA", (255, 0, 255)),
+          ("YELLOW", (0, 255, 255)), ("RED", (0, 0, 255)), ("WHITE", (255, 255, 255))]
+FINGER_SMOOTHING = 0.5   # 0..1, higher = follows the fingertip more tightly (more jitter)
+COLOR_COOLDOWN = 1.0     # seconds between color changes
+ERASER_RATIO = 0.8       # eraser radius as a fraction of palm length
 
 
 def ensure_model():
@@ -150,6 +160,108 @@ class GestureSmoother:
         self.current = "NONE"
 
 
+class DrawingCanvas:
+    """A persistent drawing layer controlled by hand gestures."""
+
+    def __init__(self, thickness=6):
+        self.canvas = None
+        self.thickness = thickness
+        self.color_idx = 0
+        self.prev = None          # smoothed fingertip position while a stroke is active
+        self.last_gesture = "NONE"
+        self.last_color_change = -1e9
+        self.cursor = None        # where to draw the hover cursor
+        self.eraser = None        # (center, radius) while erasing
+
+    @property
+    def color(self):
+        return COLORS[self.color_idx][1]
+
+    @property
+    def color_name(self):
+        return COLORS[self.color_idx][0]
+
+    def ensure(self, shape):
+        if self.canvas is None or self.canvas.shape != shape:
+            self.canvas = np.zeros(shape, dtype=np.uint8)
+            self.prev = None
+
+    def clear(self):
+        if self.canvas is not None:
+            self.canvas[:] = 0
+        self.prev = None
+
+    def lift(self):
+        """Hand left the frame: end the current stroke."""
+        self.prev = None
+        self.cursor = None
+        self.eraser = None
+        self.last_gesture = "NONE"
+
+    def change_thickness(self, delta):
+        self.thickness = int(np.clip(self.thickness + delta, 2, 30))
+
+    def next_color(self, now):
+        if now - self.last_color_change >= COLOR_COOLDOWN:
+            self.color_idx = (self.color_idx + 1) % len(COLORS)
+            self.last_color_change = now
+            return True
+        return False
+
+    def update(self, gesture, pts, now):
+        """Apply one frame of hand input to the canvas."""
+        self.eraser = None
+        tip = np.array(pts[INDEX_TIP], dtype=float)
+
+        if gesture == "POINT":
+            if self.prev is None:
+                self.prev = tip
+            else:
+                smoothed = FINGER_SMOOTHING * tip + (1 - FINGER_SMOOTHING) * self.prev
+                cv2.line(self.canvas, tuple(int(v) for v in self.prev),
+                         tuple(int(v) for v in smoothed), self.color,
+                         self.thickness, cv2.LINE_AA)
+                self.prev = smoothed
+            self.cursor = tuple(int(v) for v in self.prev)
+        else:
+            self.prev = None
+            self.cursor = tuple(int(v) for v in tip)
+            if gesture == "FIST":
+                palm = dist(pts[WRIST], pts[MIDDLE_MCP])
+                cx = sum(pts[i][0] for i in (WRIST, INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP)) / 5
+                cy = sum(pts[i][1] for i in (WRIST, INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP)) / 5
+                radius = max(10, int(ERASER_RATIO * palm))
+                center = (int(cx), int(cy))
+                cv2.circle(self.canvas, center, radius, (0, 0, 0), -1)
+                self.eraser = (center, radius)
+                self.cursor = None
+            elif gesture == "PEACE" and self.last_gesture != "PEACE":
+                self.next_color(now)
+
+        self.last_gesture = gesture
+
+    def composite(self, frame):
+        """Paint the drawing onto the video frame (in place)."""
+        mask = self.canvas.any(axis=2)
+        frame[mask] = self.canvas[mask]
+
+    def draw_overlays(self, frame):
+        """Hover cursor and eraser outline, drawn on the video frame."""
+        if self.cursor is not None:
+            cv2.circle(frame, self.cursor, max(6, self.thickness), self.color, 2)
+        if self.eraser is not None:
+            cv2.circle(frame, self.eraser[0], self.eraser[1], (255, 255, 255), 2)
+
+    def save(self):
+        """Save the drawing as a transparent PNG and return its path."""
+        os.makedirs(DRAWINGS_DIR, exist_ok=True)
+        alpha = (self.canvas.any(axis=2) * 255).astype(np.uint8)
+        bgra = np.dstack([self.canvas, alpha])
+        path = os.path.join(DRAWINGS_DIR, time.strftime("drawing_%Y%m%d_%H%M%S.png"))
+        cv2.imwrite(path, bgra)
+        return path
+
+
 def draw_hand(frame, pts):
     for a, b in HAND_CONNECTIONS:
         cv2.line(frame, (int(pts[a][0]), int(pts[a][1])),
@@ -182,12 +294,13 @@ def main():
     landmarker = vision.HandLandmarker.create_from_options(options)
 
     smoother = GestureSmoother()
-    trail = deque(maxlen=40)
+    drawing = DrawingCanvas()
     pinch_smooth = 0.0
     prev_t = time.time()
     start_t = prev_t
     last_ts = -1
     fps = 0.0
+    toast = ("", 0.0)  # (message, time it was set)
 
     while True:
         ok, frame = cap.read()
@@ -195,6 +308,7 @@ def main():
             break
         frame = cv2.flip(frame, 1)  # mirror view feels natural
         h, w = frame.shape[:2]
+        drawing.ensure(frame.shape)
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -203,13 +317,23 @@ def main():
         last_ts = ts
         result = landmarker.detect_for_video(mp_image, ts)
 
+        pts = None
+        gesture = "NONE"
         if result.hand_landmarks:
             pts = [(p.x * w, p.y * h) for p in result.hand_landmarks[0]]
-            draw_hand(frame, pts)
-
             states = finger_states(pts)
-            fingers = sum(states)
             gesture = smoother.update(classify_gesture(pts, states))
+            drawing.update(gesture, pts, time.time())
+        else:
+            smoother.reset()
+            drawing.lift()
+
+        # Drawing goes under the hand skeleton and the text
+        drawing.composite(frame)
+        drawing.draw_overlays(frame)
+
+        if pts is not None:
+            draw_hand(frame, pts)
 
             # Pinch: 0 = closed, 1 = fully open, normalized by palm size
             palm = dist(pts[WRIST], pts[MIDDLE_MCP])
@@ -217,15 +341,11 @@ def main():
             raw = float(np.clip(raw / 1.2, 0.0, 1.0))
             pinch_smooth = 0.7 * pinch_smooth + 0.3 * raw  # exponential smoothing
 
-            tip = (int(pts[INDEX_TIP][0]), int(pts[INDEX_TIP][1]))
-            trail.append(tip)
-
             cv2.putText(frame, gesture, (20, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 0), 4)
-            cv2.putText(frame, f"Fingers: {fingers}", (20, 105),
+            cv2.putText(frame, f"Fingers: {sum(states)}", (20, 105),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-            letters = "TIMRP"
-            debug = " ".join(c if s else "-" for c, s in zip(letters, states))
+            debug = " ".join(c if s else "-" for c, s in zip("TIMRP", states))
             cv2.putText(frame, debug, (20, 140),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
             cv2.rectangle(frame, (20, 160), (220, 185), (255, 255, 255), 2)
@@ -234,15 +354,22 @@ def main():
             cv2.putText(frame, "pinch", (230, 182),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         else:
-            trail.clear()
-            smoother.reset()
             cv2.putText(frame, "No hand detected", (20, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
 
-        # Fading trail behind the fingertip
-        for i in range(1, len(trail)):
-            thickness = max(1, int(8 * i / len(trail)))
-            cv2.line(frame, trail[i - 1], trail[i], (255, 120, 0), thickness)
+        # Current color swatch + brush size
+        cv2.rectangle(frame, (w - 190, 60), (w - 150, 100), drawing.color, -1)
+        cv2.rectangle(frame, (w - 190, 60), (w - 150, 100), (255, 255, 255), 2)
+        cv2.putText(frame, f"{drawing.color_name}  {drawing.thickness}px", (w - 140, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Help line and short messages
+        cv2.putText(frame, "POINT draw | PEACE color | FIST erase | PALM move | "
+                           "c clear | s save | [ ] size | q quit",
+                    (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        if toast[0] and time.time() - toast[1] < 2.0:
+            cv2.putText(frame, toast[0], (20, h - 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
         now = time.time()
         fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev_t, 1e-6))
@@ -250,12 +377,20 @@ def main():
         cv2.putText(frame, f"{fps:.0f} FPS", (w - 150, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
-        cv2.imshow("Hand tracker (q to quit, c to clear)", frame)
+        cv2.imshow("Hand tracker (q to quit)", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
-        if key == ord("c"):
-            trail.clear()
+        elif key == ord("c"):
+            drawing.clear()
+        elif key == ord("s"):
+            path = drawing.save()
+            toast = (f"Saved {os.path.basename(path)}", time.time())
+            print("Saved", path)
+        elif key == ord("["):
+            drawing.change_thickness(-2)
+        elif key == ord("]"):
+            drawing.change_thickness(2)
 
     landmarker.close()
     cap.release()
