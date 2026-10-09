@@ -1,5 +1,6 @@
 """
-Hand tracker + air drawing + virtual mouse (MediaPipe Tasks HandLandmarker + OpenCV).
+Hand tracker + air drawing + virtual mouse + learned gestures
+(MediaPipe Tasks HandLandmarker + OpenCV).
 
 DRAW mode (default):
   POINT       draw with your index fingertip
@@ -16,8 +17,14 @@ MOUSE mode (press m, or hold THUMBS UP for 1 second):
   hold THUMBS UP (1 s)      leave mouse mode
   Emergency stop: slam your real mouse into the top-left screen corner.
 
-Keys: q = quit, m = toggle mouse mode, c = clear drawing, s = save drawing as a
-      transparent PNG in ./drawings/, [ and ] = thinner / thicker brush
+LEARNED gestures (press g): swap the hand-written rules for a classifier you trained
+yourself. Record data with collect_gestures.py, train with train_gestures.py, and the
+model is saved to models/gesture_model.joblib. Your labels must be spelled like the
+built-in ones (OPEN PALM, FIST, POINT, PEACE, THUMBS UP) for drawing/mouse to react.
+
+Keys: q = quit, m = toggle mouse mode, g = rules / learned gestures,
+      c = clear drawing, s = save drawing as a transparent PNG in ./drawings/,
+      [ and ] = thinner / thicker brush
 
 Options:
   --camera N           which camera to use (1 if an iPhone grabs index 0)
@@ -28,6 +35,8 @@ Options:
   --direct-cursor      move the cursor straight from each camera frame (old behavior)
   --still-radius PX    cursor ignores wobbles smaller than this many screen pixels
                        (default 8; raise it if the cursor shakes, 0 turns it off)
+  --model PATH         trained gesture model (default models/gesture_model.joblib)
+  --learned            start with the learned gestures instead of the rules
   --click-lookback SEC clicks land where the cursor was this long before your fingers
                        closed (default 0.2; raise it if clicks land past the target)
 
@@ -55,6 +64,7 @@ from collections import Counter, deque
 import cv2
 import mediapipe as mp
 import numpy as np
+import gesture_model
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
@@ -63,6 +73,8 @@ MODEL_PATH = os.path.join(HERE, "hand_landmarker.task")
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
              "hand_landmarker/float16/latest/hand_landmarker.task")
 DRAWINGS_DIR = os.path.join(HERE, "drawings")
+DEFAULT_GESTURE_MODEL = os.path.join(HERE, "models", "gesture_model.joblib")
+LEARNED_MIN_CONFIDENCE = 0.6   # below this the learned classifier answers UNKNOWN
 
 # MediaPipe landmark indices
 WRIST, THUMB_IP, THUMB_TIP = 0, 3, 4
@@ -184,6 +196,97 @@ def classify_gesture(pts, states=None):
     if four == (True, False, False, True):
         return "ROCK"
     return "UNKNOWN"
+
+
+def open_camera(index, width, height):
+    """Open a webcam at the requested size (exits with a hint if it can't)."""
+    cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        raise SystemExit("Could not open the camera. Check permissions or try --camera 1.")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    print(f"Camera opened: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}, "
+          f"driver reports {cap.get(cv2.CAP_PROP_FPS):.0f} fps")
+    return cap
+
+
+class HandDetector:
+    """Wraps the MediaPipe HandLandmarker: BGR frame in, pixel landmarks (or None) out.
+
+    Pass your own `landmarker` (anything with detect_for_video and close) to test
+    without the model file.
+    """
+
+    def __init__(self, landmarker=None):
+        if landmarker is None:
+            ensure_model()
+            options = vision.HandLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+                running_mode=vision.RunningMode.VIDEO,
+                num_hands=1,
+                min_hand_detection_confidence=0.6,
+                min_hand_presence_confidence=0.6,
+                min_tracking_confidence=0.6,
+            )
+            landmarker = vision.HandLandmarker.create_from_options(options)
+        self.landmarker = landmarker
+        self.start_t = time.time()
+        self.last_ts = -1
+
+    def detect(self, frame, now=None):
+        """Returns [(x, y), ...] in pixels for the first hand, or None."""
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        now = time.time() if now is None else now
+        ts = max(int((now - self.start_t) * 1000), self.last_ts + 1)  # must strictly increase
+        self.last_ts = ts
+        result = self.landmarker.detect_for_video(mp_image, ts)
+        if not result.hand_landmarks:
+            return None
+        return [(p.x * w, p.y * h) for p in result.hand_landmarks[0]]
+
+    def close(self):
+        self.landmarker.close()
+
+
+class GestureSource:
+    """Chooses between the hand-written rules and a model you trained."""
+
+    def __init__(self, model_path=DEFAULT_GESTURE_MODEL, loader=None,
+                 min_confidence=LEARNED_MIN_CONFIDENCE):
+        self.model_path = model_path
+        self.min_confidence = min_confidence
+        self._loader = loader or gesture_model.LearnedGestureClassifier.from_file
+        self.learned = None
+        self.mode = "rules"
+
+    def use_learned(self):
+        """Switch to the learned classifier. Returns (ok, message)."""
+        if self.learned is None:
+            if not os.path.exists(self.model_path):
+                return False, "No model yet: run collect_gestures.py then train_gestures.py"
+            try:
+                self.learned = self._loader(self.model_path, self.min_confidence)
+            except Exception as e:  # missing scikit-learn, bad file, old format...
+                return False, f"Could not load model: {e}"
+        self.mode = "learned"
+        return True, "Gestures: learned model"
+
+    def use_rules(self):
+        self.mode = "rules"
+        return True, "Gestures: hand-written rules"
+
+    def toggle(self):
+        return self.use_rules() if self.mode == "learned" else self.use_learned()
+
+    def classify(self, pts, states=None):
+        if self.mode == "learned":
+            return self.learned.classify(pts)
+        return classify_gesture(pts, states)
 
 
 class GestureSmoother:
@@ -898,32 +1001,16 @@ def main():
                     help="ignore cursor wobbles smaller than this many screen pixels (0 = off)")
     ap.add_argument("--click-lookback", type=float, default=PINCH_LOOKBACK,
                     help="clicks land where the cursor was this many seconds before the pinch")
+    ap.add_argument("--model", default=DEFAULT_GESTURE_MODEL,
+                    help="trained gesture model to use when you press g")
+    ap.add_argument("--learned", action="store_true",
+                    help="start with the learned gestures instead of the rules")
     args = ap.parse_args()
 
-    ensure_model()
+    detector = HandDetector()
+    stream = CameraStream(open_camera(args.camera, args.width, args.height))
 
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        raise SystemExit("Could not open the camera. Check permissions or try --camera 1.")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    print(f"Camera opened: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
-          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}, "
-          f"driver reports {cap.get(cv2.CAP_PROP_FPS):.0f} fps")
-    stream = CameraStream(cap)
-
-    options = vision.HandLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
-        running_mode=vision.RunningMode.VIDEO,
-        num_hands=1,
-        min_hand_detection_confidence=0.6,
-        min_hand_presence_confidence=0.6,
-        min_tracking_confidence=0.6,
-    )
-    landmarker = vision.HandLandmarker.create_from_options(options)
-
+    source = GestureSource(args.model)
     smoother = GestureSmoother()
     drawing = DrawingCanvas()
     mouse = MouseMode(use_driver=not args.direct_cursor, tau=args.cursor_lag,
@@ -931,8 +1018,6 @@ def main():
     hold = HoldDetector()
     pinch_smooth = 0.0
     prev_t = time.time()
-    start_t = prev_t
-    last_ts = -1
     last_id = -1
     fps = 0.0
     toast = ("", 0.0)  # (message, time it was set)
@@ -944,6 +1029,15 @@ def main():
         nonlocal toast
         toast = (message, time.time())
         print(message)
+
+    def toggle_gestures():
+        ok, message = source.toggle()
+        smoother.reset()
+        show_toast(message)
+
+    if args.learned:
+        ok, message = source.use_learned()
+        show_toast(message)
 
     def toggle_mouse():
         ok, message = mouse.toggle()
@@ -961,21 +1055,14 @@ def main():
         drawing.ensure(frame.shape)
         t1 = time.perf_counter()
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        ts = int((time.time() - start_t) * 1000)
-        ts = max(ts, last_ts + 1)  # timestamps must strictly increase
-        last_ts = ts
-        result = landmarker.detect_for_video(mp_image, ts)
+        pts = detector.detect(frame)
         t2 = time.perf_counter()
 
-        pts = None
         gesture = "NONE"
         now_t = time.time()
-        if result.hand_landmarks:
-            pts = [(p.x * w, p.y * h) for p in result.hand_landmarks[0]]
+        if pts is not None:
             states = finger_states(pts)
-            gesture = smoother.update(classify_gesture(pts, states))
+            gesture = smoother.update(source.classify(pts, states))
 
             if mouse.on:
                 drawing.lift()
@@ -1013,6 +1100,8 @@ def main():
 
             cv2.putText(frame, gesture, (20, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 0), 4)
+            cv2.putText(frame, f"[{source.mode}]", (w - 150, 65),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             cv2.putText(frame, f"Fingers: {sum(states)}", (20, 105),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
             debug = " ".join(c if s else "-" for c, s in zip("TIMRP", states))
@@ -1050,7 +1139,7 @@ def main():
             help2 = "FIST=pause | hold THUMBS UP or press m = exit | q quit"
         else:
             help1 = "POINT draw | PEACE color | FIST erase | PALM move | c clear | s save"
-            help2 = "m or hold THUMBS UP = mouse mode | [ ] size | q quit"
+            help2 = "m = mouse mode | g = rules/learned | [ ] size | q quit"
         cv2.putText(frame, help1, (10, h - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
         cv2.putText(frame, help2, (10, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
         if toast[0] and time.time() - toast[1] < 2.0:
@@ -1086,6 +1175,8 @@ def main():
             break
         elif key == ord("m"):
             toggle_mouse()
+        elif key == ord("g"):
+            toggle_gestures()
         elif key == ord("c"):
             drawing.clear()
         elif key == ord("s"):
@@ -1097,7 +1188,7 @@ def main():
             drawing.change_thickness(2)
 
     mouse.disable()
-    landmarker.close()
+    detector.close()
     stream.stop()
     cv2.destroyAllWindows()
 

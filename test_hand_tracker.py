@@ -1,5 +1,5 @@
 """
-Tests for hand_tracker.py. No camera, model file, or pyautogui needed.
+Tests for hand_tracker.py (and its use of gesture_model.py). No camera, model file, or pyautogui needed.
 
 Run from the project folder (same folder as hand_tracker.py):
     python -m unittest -v test_hand_tracker.py
@@ -1235,6 +1235,173 @@ class TestPyAutoGuiBackend(unittest.TestCase):
         fake = types.SimpleNamespace(FAILSAFE=True, PAUSE=0, size=lambda: (1440, 900))
         with mock.patch.dict(sys.modules, {"pyautogui": fake}):
             self.assertEqual(ht.PyAutoGuiBackend().size(), (1440, 900))
+
+
+class FakeLandmarker:
+    """Stands in for MediaPipe's HandLandmarker."""
+
+    def __init__(self, hands=None):
+        self.hands = hands          # list of (x, y) in 0..1, or None for "no hand"
+        self.timestamps = []
+        self.closed = False
+
+    def detect_for_video(self, image, ts):
+        self.timestamps.append(ts)
+        if self.hands is None:
+            return types.SimpleNamespace(hand_landmarks=[])
+        lm = [types.SimpleNamespace(x=x, y=y) for x, y in self.hands]
+        return types.SimpleNamespace(hand_landmarks=[lm])
+
+    def close(self):
+        self.closed = True
+
+
+class TestHandDetector(unittest.TestCase):
+    FRAME = np.zeros((200, 400, 3), dtype=np.uint8)
+
+    def test_landmarks_are_scaled_to_pixels(self):
+        det = ht.HandDetector(FakeLandmarker([(0.5, 0.25)] * 21))
+        pts = det.detect(self.FRAME, now=det.start_t + 1)
+        self.assertEqual(len(pts), 21)
+        self.assertAlmostEqual(pts[0][0], 200.0)   # 0.5 * width 400
+        self.assertAlmostEqual(pts[0][1], 50.0)    # 0.25 * height 200
+
+    def test_no_hand_returns_none(self):
+        det = ht.HandDetector(FakeLandmarker(None))
+        self.assertIsNone(det.detect(self.FRAME))
+
+    def test_timestamps_strictly_increase_even_if_the_clock_stalls(self):
+        fake = FakeLandmarker(None)
+        det = ht.HandDetector(fake)
+        for _ in range(5):
+            det.detect(self.FRAME, now=det.start_t + 1.0)   # same instant every time
+        self.assertEqual(fake.timestamps, sorted(set(fake.timestamps)))
+        self.assertEqual(len(fake.timestamps), 5)
+
+    def test_timestamps_follow_the_clock_in_milliseconds(self):
+        fake = FakeLandmarker(None)
+        det = ht.HandDetector(fake)
+        det.detect(self.FRAME, now=det.start_t + 2.5)
+        self.assertEqual(fake.timestamps[-1], 2500)
+
+    def test_close_closes_the_landmarker(self):
+        fake = FakeLandmarker(None)
+        ht.HandDetector(fake).close()
+        self.assertTrue(fake.closed)
+
+
+class TestOpenCamera(unittest.TestCase):
+    def test_exits_with_a_hint_when_the_camera_will_not_open(self):
+        cap = mock.Mock()
+        cap.isOpened.return_value = False
+        with mock.patch.object(ht.cv2, "VideoCapture", return_value=cap) as vc:
+            with self.assertRaisesRegex(SystemExit, "--camera 1"):
+                ht.open_camera(3, 640, 480)
+        vc.assert_called_once_with(3)
+
+    def test_requests_the_size_and_a_small_buffer(self):
+        cap = mock.Mock()
+        cap.isOpened.return_value = True
+        cap.get.return_value = 30
+        with mock.patch.object(ht.cv2, "VideoCapture", return_value=cap):
+            self.assertIs(ht.open_camera(0, 800, 600), cap)
+        cap.set.assert_any_call(ht.cv2.CAP_PROP_FRAME_WIDTH, 800)
+        cap.set.assert_any_call(ht.cv2.CAP_PROP_FRAME_HEIGHT, 600)
+        cap.set.assert_any_call(ht.cv2.CAP_PROP_BUFFERSIZE, 1)
+
+
+class FakeLearned:
+    def __init__(self, answer):
+        self.answer = answer
+        self.calls = 0
+
+    def classify(self, pts):
+        self.calls += 1
+        return self.answer
+
+
+class TestGestureSource(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "m.joblib")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def make_model_file(self):
+        with open(self.path, "wb") as f:
+            f.write(b"x")
+
+    def test_starts_with_the_rules(self):
+        src = ht.GestureSource(self.path, loader=lambda p, c: FakeLearned("PEACE"))
+        self.assertEqual(src.mode, "rules")
+        self.assertEqual(src.classify(build_hand("I", "tucked")), "POINT")
+
+    def test_missing_model_file_stays_on_rules_with_a_hint(self):
+        src = ht.GestureSource(self.path, loader=lambda p, c: FakeLearned("PEACE"))
+        ok, message = src.toggle()
+        self.assertFalse(ok)
+        self.assertIn("train_gestures.py", message)
+        self.assertEqual(src.mode, "rules")
+
+    def test_toggle_switches_to_the_learned_model_and_back(self):
+        self.make_model_file()
+        learned = FakeLearned("PEACE")
+        src = ht.GestureSource(self.path, loader=lambda p, c: learned)
+        self.assertTrue(src.toggle()[0])
+        self.assertEqual(src.mode, "learned")
+        self.assertEqual(src.classify(build_hand("I", "tucked")), "PEACE")
+        self.assertEqual(learned.calls, 1)
+        src.toggle()
+        self.assertEqual(src.mode, "rules")
+        self.assertEqual(src.classify(build_hand("I", "tucked")), "POINT")
+
+    def test_model_is_loaded_only_once(self):
+        self.make_model_file()
+        loads = []
+        src = ht.GestureSource(self.path, loader=lambda p, c: loads.append(p) or FakeLearned("FIST"))
+        for _ in range(4):
+            src.toggle()
+        self.assertEqual(len(loads), 1)
+
+    def test_loader_receives_the_path_and_confidence(self):
+        self.make_model_file()
+        seen = []
+        src = ht.GestureSource(self.path, loader=lambda p, c: seen.append((p, c)) or FakeLearned("FIST"),
+                               min_confidence=0.8)
+        src.use_learned()
+        self.assertEqual(seen, [(self.path, 0.8)])
+
+    def test_a_broken_model_file_keeps_the_rules_and_reports_why(self):
+        self.make_model_file()
+
+        def broken(path, conf):
+            raise ValueError("bad file")
+        src = ht.GestureSource(self.path, loader=broken)
+        ok, message = src.use_learned()
+        self.assertFalse(ok)
+        self.assertIn("bad file", message)
+        self.assertEqual(src.mode, "rules")
+        self.assertEqual(src.classify(build_hand("", "tucked")), "FIST")
+
+    def test_works_with_a_real_trained_model(self):
+        import gesture_model
+        rng = np.random.default_rng(0)
+        X, y = [], []
+        for label, ext, thumb in [("FIST", "", "tucked"), ("OPEN PALM", "IMRP", "out"),
+                                  ("POINT", "I", "tucked")]:
+            for _ in range(40):
+                a = np.array(build_hand(ext, thumb)) + rng.normal(0, 1.5, (21, 2))
+                X.append(a)
+                y.append(label)
+        norm = gesture_model.normalize_batch(np.array(X))
+        model = gesture_model.train_model(gesture_model.features_from_normalized(norm), y)
+        gesture_model.save_model(model, list(model.classes_), self.path)
+        src = ht.GestureSource(self.path)
+        self.assertTrue(src.use_learned()[0])
+        self.assertEqual(src.classify(build_hand("I", "tucked")), "POINT")
+        self.assertEqual(src.classify(build_hand("IMRP", "out")), "OPEN PALM")
+
 
 
 if __name__ == "__main__":
