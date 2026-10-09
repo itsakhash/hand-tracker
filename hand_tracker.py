@@ -3,9 +3,11 @@ Hand tracker using your webcam (MediaPipe Tasks HandLandmarker + OpenCV).
 
 Shows:
   - the 21 hand landmarks and bones drawn on the live video
+  - a recognized gesture: FIST, OPEN PALM, POINT, PEACE, ROCK, THUMBS UP
+  - which fingers are detected as extended (T I M R P) -- handy for tuning
   - finger count (0-5)
   - pinch amount (thumb tip to index tip, normalized by hand size) as a bar
-  - a fading trail behind your index fingertip (air drawing)
+  - a fading trail behind your index fingertip
   - FPS
 
 Keys: q = quit, c = clear trail
@@ -16,8 +18,9 @@ Setup:
   python hand_tracker.py
 
 The first run downloads the hand landmark model (about 8 MB) into this folder
-as hand_landmarker.task. On macOS, allow camera access for Terminal (or your
-IDE) when prompted: System Settings > Privacy & Security > Camera.
+as hand_landmarker.task. If the download fails (common SSL issue on macOS),
+download it with curl instead (see README). On macOS, allow camera access for
+Terminal (or your IDE): System Settings > Privacy & Security > Camera.
 If the wrong camera opens, run with --camera 1.
 """
 import argparse
@@ -25,7 +28,7 @@ import math
 import os
 import time
 import urllib.request
-from collections import deque
+from collections import Counter, deque
 
 import cv2
 import mediapipe as mp
@@ -54,6 +57,12 @@ HAND_CONNECTIONS = [
     (0, 17),                                 # palm edge
 ]
 
+# Tunable thresholds
+THUMB_OUT_RATIO = 0.5    # thumb tip must be this many palm-lengths from the index base
+THUMB_UP_MARGIN = 0.3    # thumb tip must be this many palm-lengths above the index base
+SMOOTH_FRAMES = 7        # gesture is decided by a vote over this many frames
+MIN_VOTES = 4            # votes needed to switch to a new gesture
+
 
 def ensure_model():
     """Download the model file the first time the script runs."""
@@ -67,8 +76,8 @@ def ensure_model():
             os.remove(MODEL_PATH)
         raise SystemExit(
             f"Could not download the model: {e}\n"
-            "Download hand_landmarker.task manually from the MediaPipe Hand Landmarker "
-            "page (Models section) and put it next to hand_tracker.py."
+            f"Download it with:  curl -L -o hand_landmarker.task {MODEL_URL}\n"
+            "and put it next to hand_tracker.py."
         )
     print("Model saved.")
 
@@ -77,18 +86,68 @@ def dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
-def count_fingers(pts):
-    """Count extended fingers from pixel landmarks (hand roughly upright)."""
-    count = 0
-    # Four fingers: tip is above its PIP joint (smaller y) when extended
-    for tip, pip in [(INDEX_TIP, INDEX_PIP), (MIDDLE_TIP, MIDDLE_PIP),
-                     (RING_TIP, RING_PIP), (PINKY_TIP, PINKY_PIP)]:
-        if pts[tip][1] < pts[pip][1]:
-            count += 1
-    # Thumb: extended if the tip is farther from the pinky base than the IP joint is
-    if dist(pts[THUMB_TIP], pts[PINKY_MCP]) > dist(pts[THUMB_IP], pts[PINKY_MCP]):
-        count += 1
-    return count
+def finger_states(pts):
+    """Return [thumb, index, middle, ring, pinky] as booleans (True = extended).
+
+    Four fingers: the tip is farther from the wrist than its PIP joint, which
+    works for any hand orientation. Thumb: the tip is far enough from the
+    base of the index finger (relative to palm size).
+    """
+    wrist = pts[WRIST]
+    palm = max(dist(pts[WRIST], pts[MIDDLE_MCP]), 1e-6)
+    thumb = dist(pts[THUMB_TIP], pts[INDEX_MCP]) > THUMB_OUT_RATIO * palm
+    others = [dist(pts[tip], wrist) > dist(pts[pip], wrist)
+              for tip, pip in [(INDEX_TIP, INDEX_PIP), (MIDDLE_TIP, MIDDLE_PIP),
+                               (RING_TIP, RING_PIP), (PINKY_TIP, PINKY_PIP)]]
+    return [thumb] + others
+
+
+def thumb_points_up(pts):
+    """True if the thumb tip is clearly above the base of the index finger."""
+    palm = max(dist(pts[WRIST], pts[MIDDLE_MCP]), 1e-6)
+    return pts[THUMB_TIP][1] < pts[INDEX_MCP][1] - THUMB_UP_MARGIN * palm
+
+
+def classify_gesture(pts, states=None):
+    """Return a gesture name for one frame of landmarks."""
+    if states is None:
+        states = finger_states(pts)
+    thumb, index, middle, ring, pinky = states
+    four = (index, middle, ring, pinky)
+
+    if thumb and not any(four) and thumb_points_up(pts):
+        return "THUMBS UP"
+    if all(four):
+        return "OPEN PALM"
+    if not any(four):
+        return "FIST"
+    if four == (True, False, False, False):
+        return "POINT"
+    if four == (True, True, False, False):
+        return "PEACE"
+    if four == (True, False, False, True):
+        return "ROCK"
+    return "UNKNOWN"
+
+
+class GestureSmoother:
+    """Majority vote over recent frames so the label doesn't flicker."""
+
+    def __init__(self, size=SMOOTH_FRAMES, min_votes=MIN_VOTES):
+        self.history = deque(maxlen=size)
+        self.min_votes = min_votes
+        self.current = "NONE"
+
+    def update(self, gesture):
+        self.history.append(gesture)
+        winner, votes = Counter(self.history).most_common(1)[0]
+        if votes >= self.min_votes:
+            self.current = winner
+        return self.current
+
+    def reset(self):
+        self.history.clear()
+        self.current = "NONE"
 
 
 def draw_hand(frame, pts):
@@ -101,7 +160,7 @@ def draw_hand(frame, pts):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--camera", type=int, default=1)
+    ap.add_argument("--camera", type=int, default=0)
     args = ap.parse_args()
 
     ensure_model()
@@ -122,6 +181,7 @@ def main():
     )
     landmarker = vision.HandLandmarker.create_from_options(options)
 
+    smoother = GestureSmoother()
     trail = deque(maxlen=40)
     pinch_smooth = 0.0
     prev_t = time.time()
@@ -147,7 +207,9 @@ def main():
             pts = [(p.x * w, p.y * h) for p in result.hand_landmarks[0]]
             draw_hand(frame, pts)
 
-            fingers = count_fingers(pts)
+            states = finger_states(pts)
+            fingers = sum(states)
+            gesture = smoother.update(classify_gesture(pts, states))
 
             # Pinch: 0 = closed, 1 = fully open, normalized by palm size
             palm = dist(pts[WRIST], pts[MIDDLE_MCP])
@@ -158,15 +220,22 @@ def main():
             tip = (int(pts[INDEX_TIP][0]), int(pts[INDEX_TIP][1]))
             trail.append(tip)
 
-            cv2.putText(frame, f"Fingers: {fingers}", (20, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-            cv2.rectangle(frame, (20, 80), (220, 105), (255, 255, 255), 2)
-            cv2.rectangle(frame, (20, 80), (20 + int(200 * pinch_smooth), 105),
+            cv2.putText(frame, gesture, (20, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 0), 4)
+            cv2.putText(frame, f"Fingers: {fingers}", (20, 105),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            letters = "TIMRP"
+            debug = " ".join(c if s else "-" for c, s in zip(letters, states))
+            cv2.putText(frame, debug, (20, 140),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+            cv2.rectangle(frame, (20, 160), (220, 185), (255, 255, 255), 2)
+            cv2.rectangle(frame, (20, 160), (20 + int(200 * pinch_smooth), 185),
                           (0, 200, 255), -1)
-            cv2.putText(frame, "pinch", (230, 102),
+            cv2.putText(frame, "pinch", (230, 182),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         else:
             trail.clear()
+            smoother.reset()
             cv2.putText(frame, "No hand detected", (20, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
 
