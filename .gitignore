@@ -1,0 +1,11 @@
+.venv
+.venv.nosync/
+__pycache__/
+*.pyc
+.DS_Store
+
+# recordings and data (they contain your face, and they're big)
+*.mp4
+*.mov
+data/
+*.task
