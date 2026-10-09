@@ -94,6 +94,13 @@ def fist_pinch_hand():
     return mouse_hand(index_tip=(300, 420), thumb_tip=(295, 415), middle_tip=(305, 415))
 
 
+def hand_at(mid=(265, 295), spread=1.0):
+    """Open hand whose pointer sits at `mid`; spread 1.0 = open, ~0.05 = thumb and index closed."""
+    index_tip = (mid[0] + 35 * spread, mid[1] - 35 * spread)
+    thumb_tip = (mid[0] - 35 * spread, mid[1] + 35 * spread)
+    return mouse_hand(index_tip=index_tip, thumb_tip=thumb_tip)
+
+
 def shifted(pts, dx, dy):
     return [(x + dx, y + dy) for x, y in pts]
 
@@ -427,36 +434,374 @@ class TestScreenMapping(unittest.TestCase):
         self.assertGreater(ht.SCREEN_EDGE_PAD, 0)
 
 
-class TestCursorSmoother(unittest.TestCase):
+class TestOneEuroFilter(unittest.TestCase):
+    DT = 1 / 30
+
+    def feed(self, f, u, v, n, t0=0.0):
+        pos = None
+        for i in range(n):
+            pos = f.update(u, v, t0 + i * self.DT)
+        return pos
+
     def test_first_value_passes_through(self):
-        s = ht.CursorSmoother()
-        self.assertEqual(s.update(0.3, 0.7), (0.3, 0.7))
+        f = ht.OneEuroFilter2D()
+        self.assertEqual(f.update(0.3, 0.7, 0.0), (0.3, 0.7))
 
     def test_small_jitter_is_damped(self):
-        s = ht.CursorSmoother()
-        s.update(0.5, 0.5)
-        x, _ = s.update(0.51, 0.5)
-        self.assertLess(abs(x - 0.5), 0.003)      # moved less than a third of the jitter
+        f = ht.OneEuroFilter2D()
+        self.feed(f, 0.5, 0.5, 30)
+        x, _ = f.update(0.51, 0.5, 30 * self.DT)
+        self.assertGreater(x, 0.5)
+        self.assertLess(x - 0.5, 0.004)           # less than half of the 0.01 jitter gets through
 
     def test_fast_movement_is_followed_closely(self):
-        s = ht.CursorSmoother()
-        s.update(0.5, 0.5)
-        x, _ = s.update(0.9, 0.5)
+        f = ht.OneEuroFilter2D()
+        self.feed(f, 0.5, 0.5, 30)
+        x, _ = f.update(0.9, 0.5, 30 * self.DT)
         self.assertGreater(x, 0.75)               # most of a big jump comes through at once
 
     def test_converges_to_a_steady_target(self):
-        s = ht.CursorSmoother()
-        s.update(0.2, 0.2)
-        for _ in range(100):
-            pos = s.update(0.8, 0.6)
+        f = ht.OneEuroFilter2D()
+        f.update(0.2, 0.2, 0.0)
+        pos = self.feed(f, 0.8, 0.6, 200, t0=self.DT)
         self.assertAlmostEqual(pos[0], 0.8, places=3)
         self.assertAlmostEqual(pos[1], 0.6, places=3)
 
     def test_reset_forgets_position(self):
-        s = ht.CursorSmoother()
-        s.update(0.2, 0.2)
+        f = ht.OneEuroFilter2D()
+        f.update(0.2, 0.2, 0.0)
+        f.reset()
+        self.assertEqual(f.update(0.9, 0.9, 5.0), (0.9, 0.9))
+
+    def test_behaves_the_same_at_different_frame_rates(self):
+        finals = []
+        for fps in (15, 30):
+            f = ht.OneEuroFilter2D()
+            pos = None
+            for i in range(fps + 1):
+                t = i / fps
+                pos = f.update(0.2 + 0.6 * t, 0.5, t)
+            finals.append(pos[0])
+        self.assertLess(abs(finals[0] - finals[1]), 0.03)
+
+    def test_duplicate_timestamps_do_not_crash(self):
+        f = ht.OneEuroFilter2D()
+        f.update(0.5, 0.5, 1.0)
+        pos = f.update(0.6, 0.5, 1.0)
+        self.assertTrue(all(math.isfinite(c) for c in pos))
+
+
+class TestCursorDriver(unittest.TestCase):
+    def make(self, tau=0.04):
+        backend = FakeBackend()
+        return ht.CursorDriver(backend, tau=tau), backend
+
+    def wait_for(self, condition, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline and not condition():
+            time.sleep(0.005)
+        return condition()
+
+    def test_no_target_means_no_movement(self):
+        d, b = self.make()
+        self.assertIsNone(d.step(0.01))
+        self.assertEqual(b.calls, [])
+
+    def test_first_target_snaps_there(self):
+        d, b = self.make()
+        d.set_target((100, 200))
+        self.assertEqual(d.step(0.008), (100, 200))
+        self.assertEqual(b.calls, [("move", 100, 200)])
+
+    def test_chases_a_new_target_exponentially(self):
+        d, b = self.make(tau=0.04)
+        d.set_target((0, 0))
+        d.step(0.01)
+        d.set_target((100, 0))
+        out = d.step(0.04)                         # one time constant: ~63% of the way
+        self.assertEqual(out[0], 63)
+
+    def test_glides_through_many_intermediate_positions(self):
+        d, b = self.make()
+        d.set_target((0, 0))
+        d.step(0.01)
+        d.set_target((300, 0))
+        outs = [d.step(1 / 120) for _ in range(20)]
+        xs = [o[0] for o in outs if o]
+        self.assertGreater(len(set(xs)), 10)       # smooth, not one big jump
+        self.assertEqual(xs, sorted(xs))
+        self.assertLessEqual(xs[-1], 300)
+
+    def test_stops_sending_moves_once_it_has_arrived(self):
+        d, b = self.make()
+        d.set_target((50, 50))
+        for _ in range(300):
+            d.step(0.01)
+        n = len(b.calls)
+        d.step(0.01)
+        self.assertEqual(len(b.calls), n)
+        self.assertEqual(b.calls[-1], ("move", 50, 50))
+
+    def test_real_thread_moves_the_cursor_and_stops(self):
+        d, b = self.make(tau=0.01)
+        d.start()
+        d.set_target((10, 20))
+        self.assertTrue(self.wait_for(lambda: b.count("move") > 0))
+        self.assertEqual(b.calls[0], ("move", 10, 20))
+        d.stop()
+        self.assertFalse(d.thread.is_alive())
+
+    def test_start_twice_does_not_create_two_threads(self):
+        d, b = self.make()
+        d.start()
+        first = d.thread
+        d.start()
+        self.assertIs(d.thread, first)
+        d.stop()
+
+    def test_backend_error_is_recorded_and_the_thread_ends(self):
+        backend = FakeBackend()
+
+        def boom(x, y):
+            raise RuntimeError("failsafe")
+        backend.move_to = boom
+        d = ht.CursorDriver(backend)
+        d.start()
+        d.set_target((1, 1))
+        self.assertTrue(self.wait_for(lambda: d.error is not None))
+        self.assertIsInstance(d.error, RuntimeError)
+        d.thread.join(timeout=1.0)
+        self.assertFalse(d.thread.is_alive())
+
+    def test_reset_clears_target_position_and_error(self):
+        d, b = self.make()
+        d.set_target((5, 5))
+        d.step(0.01)
+        d.error = RuntimeError("old")
+        d.reset()
+        self.assertIsNone(d.target)
+        self.assertIsNone(d.error)
+        self.assertIsNone(d.step(0.01))
+
+
+class TestStillnessLeash(unittest.TestCase):
+    def test_wobble_inside_the_circle_changes_nothing(self):
+        s = ht.StillnessLeash(radius=8)
+        first = s.update((100, 100))
+        for px in [(103, 98), (96, 104), (105, 101), (99, 95), (107, 100)]:
+            self.assertEqual(s.update(px), first)
+
+    def test_leaving_the_circle_pulls_the_output_along_at_its_edge(self):
+        s = ht.StillnessLeash(radius=8)
+        s.update((0, 0))
+        self.assertEqual(s.update((20, 0)), (12, 0))     # follows, trailing by the radius
+        self.assertEqual(s.update((10, 0)), (12, 0))     # back inside the circle: stays
+
+    def test_no_jump_when_starting_to_move(self):
+        s = ht.StillnessLeash(radius=8)
+        s.update((0, 0))
+        self.assertEqual(s.update((9, 0)), (1, 0))       # only the part beyond the circle
+
+    def test_radius_zero_passes_everything_through(self):
+        s = ht.StillnessLeash(radius=0)
+        s.update((0, 0))
+        self.assertEqual(s.update((3, 4)), (3, 4))
+
+    def test_set_and_reset(self):
+        s = ht.StillnessLeash(radius=8)
+        s.update((0, 0))
+        s.set((500, 500))
+        self.assertEqual(s.update((503, 502)), (500, 500))
         s.reset()
-        self.assertEqual(s.update(0.9, 0.9), (0.9, 0.9))
+        self.assertEqual(s.update((7, 7)), (7, 7))
+
+
+class TestCursorDriverSnap(unittest.TestCase):
+    def test_snap_moves_immediately_and_nothing_chases_it_back(self):
+        backend = FakeBackend()
+        d = ht.CursorDriver(backend, tau=0.04)
+        d.set_target((0, 0))
+        d.step(0.01)
+        d.set_target((300, 0))
+        d.step(0.02)                                     # mid-chase
+        self.assertEqual(d.snap((120, 40)), (120, 40))
+        self.assertEqual(backend.calls[-1], ("move", 120, 40))
+        n = len(backend.calls)
+        self.assertIsNone(d.step(0.05))                  # target is the snap point now
+        self.assertEqual(len(backend.calls), n)
+
+    def test_snap_while_the_thread_is_running_sticks(self):
+        backend = FakeBackend()
+        d = ht.CursorDriver(backend, tau=0.01)
+        d.start()
+        d.set_target((0, 0))
+        time.sleep(0.05)
+        d.set_target((500, 500))
+        d.snap((50, 60))
+        time.sleep(0.15)
+        d.stop()
+        self.assertEqual(backend.calls[-1], ("move", 50, 60))
+
+
+class TestMouseStability(unittest.TestCase):
+    """The wobble and click-accuracy fixes, with a fake mouse."""
+
+    def setUp(self):
+        self.backend = FakeBackend()
+        self.m = ht.MouseController(self.backend)
+        self.t = 10.0
+
+    def frame(self, gesture, pts, dt=0.033):
+        self.m.update(gesture, pts, 640, 480, self.t)
+        self.t += dt
+
+    def moves(self):
+        return [c for c in self.backend.calls if c[0] == "move"]
+
+    def test_jitter_while_the_hand_is_still_does_not_move_the_cursor(self):
+        self.frame("OPEN PALM", hand_at())
+        n = len(self.moves())
+        for i in range(60):
+            wobble = 1.5 if i % 2 else -1.5
+            self.frame("OPEN PALM", hand_at((265 + wobble, 295 - wobble), 1.0))
+        self.assertEqual(len(self.moves()), n)
+
+    def test_real_movement_still_gets_through(self):
+        self.frame("OPEN PALM", hand_at())
+        n = len(self.moves())
+        for _ in range(20):
+            self.frame("OPEN PALM", hand_at((305, 295), 1.0))
+        self.assertGreater(len(self.moves()), n)
+
+    def test_leash_can_be_turned_off(self):
+        m = ht.MouseController(self.backend, still_radius=0)
+        m.update("OPEN PALM", hand_at(), 640, 480, 10.0)
+        before = len(self.moves())
+        for i in range(10):
+            m.update("OPEN PALM", hand_at((265 + 3 * (i % 2), 295), 1.0), 640, 480, 10.1 + i * 0.033)
+        self.assertGreater(len(self.moves()), before)
+
+    def close_fingers_while_drifting(self, drift_per_frame=4):
+        """Hold still, then close thumb and index while the pointer drifts sideways."""
+        for _ in range(10):
+            self.frame("POINT", hand_at())
+        before = self.m.last_px
+        x = 265
+        for spread in (0.6, 0.3, 0.05, 0.05):
+            x += drift_per_frame
+            self.frame("POINT", hand_at((x, 295), spread))
+        return before, x
+
+    def test_click_lands_where_the_cursor_was_before_the_fingers_closed(self):
+        before, _ = self.close_fingers_while_drifting()
+        self.assertEqual(self.backend.count("down"), 1)
+        i = self.backend.names().index("down")
+        last_move_before_click = [c for c in self.backend.calls[:i] if c[0] == "move"][-1]
+        self.assertEqual((last_move_before_click[1], last_move_before_click[2]), before)
+
+    def test_cursor_stays_locked_during_the_click_and_just_after_release(self):
+        _, x = self.close_fingers_while_drifting()
+        n = len(self.moves())
+        for i in range(5):                                         # tiny wobble while pinched
+            self.frame("POINT", hand_at((x + (2 if i % 2 else -2), 295), 0.05))
+        self.assertEqual(len(self.moves()), n)
+        self.frame("POINT", hand_at((x + 10, 295), 1.0))           # fingers open: release
+        self.assertEqual(self.backend.count("up"), 1)
+        for _ in range(3):                                         # still inside the freeze
+            self.frame("POINT", hand_at((x + 10, 295), 1.0))
+        self.assertEqual(len(self.moves()), n)
+        self.t += 0.3                                              # freeze is over
+        for _ in range(5):
+            self.frame("POINT", hand_at((x + 10, 295), 1.0))
+        self.assertGreater(len(self.moves()), n)
+
+    def test_moving_far_while_pinched_becomes_a_drag(self):
+        self.close_fingers_while_drifting(drift_per_frame=0)
+        n = len(self.moves())
+        for _ in range(10):
+            self.frame("POINT", hand_at((320, 295), 0.05))
+        self.assertGreater(len(self.moves()), n)
+        self.assertEqual(self.backend.count("up"), 0)
+        self.assertIsNone(self.m.click_lock)
+
+    def test_fast_motion_is_not_snapped_back_when_you_click(self):
+        for i in range(8):                                         # brisk sweep to the right
+            self.frame("OPEN PALM", hand_at((200 + 25 * i, 295), 1.0))
+        for _ in range(3):
+            self.frame("POINT", hand_at((375, 295), 0.05))
+        self.assertEqual(self.backend.count("down"), 1)
+        xs = [c[1] for c in self.moves()]
+        self.assertEqual(xs, sorted(xs))                           # never jumps backward
+
+    def test_lookback_of_zero_clicks_at_the_current_spot(self):
+        m = ht.MouseController(self.backend, lookback=0.0)
+        t = 10.0
+        for _ in range(10):
+            m.update("POINT", hand_at(), 640, 480, t)
+            t += 0.033
+        x = 265
+        for spread in (0.6, 0.3, 0.05, 0.05):
+            x += 6
+            m.update("POINT", hand_at((x, 295), spread), 640, 480, t)
+            t += 0.033
+        i = self.backend.names().index("down")
+        last_move_before_click = [c for c in self.backend.calls[:i] if c[0] == "move"][-1]
+        self.assertEqual((last_move_before_click[1], last_move_before_click[2]), m.last_px)
+
+    def test_right_click_freezes_the_cursor_afterwards(self):
+        for _ in range(10):
+            self.frame("POINT", hand_at())
+        before = self.m.last_px
+        for _ in range(4):
+            self.frame("UNKNOWN", right_pinch_hand())
+        self.assertEqual(self.backend.calls.count(("click", "right")), 1)
+        self.assertEqual(self.m.last_px, before)
+        n = len(self.moves())
+        for _ in range(8):                                         # 0.26 s: still frozen
+            self.frame("OPEN PALM", hand_at((400, 295), 1.0))
+        self.assertEqual(len(self.moves()), n)
+        self.t += 0.5
+        for _ in range(5):
+            self.frame("OPEN PALM", hand_at((400, 295), 1.0))
+        self.assertGreater(len(self.moves()), n)
+
+    def test_losing_the_hand_clears_click_state(self):
+        self.close_fingers_while_drifting()
+        self.m.hand_lost()
+        self.assertIsNone(self.m.click_lock)
+        self.assertEqual(len(self.m.history), 0)
+        self.assertFalse(self.m.left_down)
+
+
+class TestStabilityWithDriver(unittest.TestCase):
+    def test_click_snaps_the_real_cursor_before_pressing(self):
+        backend = FakeBackend()
+        driver = ht.CursorDriver(backend)
+        m = ht.MouseController(backend, driver)
+        t = 10.0
+        for _ in range(10):
+            m.update("POINT", hand_at(), 640, 480, t)
+            driver.step(0.033)
+            t += 0.033
+        before = driver.target
+        x = 265
+        for spread in (0.6, 0.3, 0.05, 0.05):
+            x += 4
+            m.update("POINT", hand_at((x, 295), spread), 640, 480, t)
+            driver.step(0.033)
+            t += 0.033
+        names = backend.names()
+        i = names.index("down")
+        self.assertEqual(backend.calls[i - 1], ("move", int(before[0]), int(before[1])))
+
+
+class TestMouseModeSettings(unittest.TestCase):
+    def test_stability_settings_reach_the_controller(self):
+        backend = FakeBackend()
+        mode = ht.MouseMode(backend_factory=lambda: backend, still_radius=12, lookback=0.3)
+        mode.enable()
+        self.assertEqual(mode.controller.leash.radius, 12)
+        self.assertEqual(mode.controller.lookback, 0.3)
 
 
 class TestPinchDetector(unittest.TestCase):
@@ -733,6 +1078,121 @@ class TestMouseMode(unittest.TestCase):
         mode.enable()
         self.assertIsNone(mode.controller.last_px)
         self.assertFalse(mode.controller.left_down)
+
+
+class TestMouseControllerWithDriver(unittest.TestCase):
+    def setUp(self):
+        self.backend = FakeBackend()
+        self.driver = ht.CursorDriver(self.backend)
+        self.m = ht.MouseController(self.backend, self.driver)
+
+    def test_controller_sets_a_target_and_the_driver_does_the_moving(self):
+        self.m.update("OPEN PALM", mouse_hand(), 640, 480, 10.0)
+        self.assertEqual(self.backend.count("move"), 0)
+        self.assertIsNotNone(self.driver.target)
+        self.driver.step(0.01)
+        self.assertEqual(self.backend.count("move"), 1)
+
+    def test_target_stays_inside_the_screen(self):
+        for i, dx in enumerate((-600, 0, 600)):
+            self.m.update("OPEN PALM", shifted(mouse_hand(), dx, -300), 640, 480, 10.0 + i)
+            x, y = self.driver.target
+            self.assertTrue(ht.SCREEN_EDGE_PAD <= x <= 1920 - 1 - ht.SCREEN_EDGE_PAD)
+            self.assertTrue(ht.SCREEN_EDGE_PAD <= y <= 1080 - 1 - ht.SCREEN_EDGE_PAD)
+
+    def test_clicks_still_go_straight_to_the_backend(self):
+        for i in range(4):
+            self.m.update("POINT", left_pinch_hand(), 640, 480, 10.0 + i * 0.03)
+        self.assertEqual(self.backend.count("down"), 1)
+
+    def test_fist_does_not_change_the_target(self):
+        self.m.update("OPEN PALM", mouse_hand(), 640, 480, 10.0)
+        before = self.driver.target
+        for i in range(5):
+            self.m.update("FIST", shifted(mouse_hand(), 150, 80), 640, 480, 10.1 + i * 0.03)
+        self.assertEqual(self.driver.target, before)
+
+    def test_moving_the_hand_moves_the_target_the_same_way(self):
+        self.m.update("OPEN PALM", mouse_hand(), 640, 480, 10.0)
+        start_x = self.driver.target[0]
+        for i in range(30):
+            self.m.update("OPEN PALM", shifted(mouse_hand(), 80, 0), 640, 480, 10.1 + i * 0.033)
+        self.assertGreater(self.driver.target[0], start_x + 300)
+
+
+class TestMouseModeWithDriver(unittest.TestCase):
+    def wait_for(self, condition, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline and not condition():
+            time.sleep(0.005)
+        return condition()
+
+    def make(self, backend=None, tau=ht.CURSOR_FOLLOW_TAU):
+        backend = backend or FakeBackend()
+        return ht.MouseMode(backend_factory=lambda: backend, use_driver=True, tau=tau), backend
+
+    def test_enable_starts_the_driver_and_disable_stops_it(self):
+        mode, _ = self.make()
+        mode.enable()
+        self.assertTrue(mode.driver.thread.is_alive())
+        mode.disable()
+        self.assertFalse(mode.driver.thread.is_alive())
+        self.assertFalse(mode.on)
+
+    def test_cursor_moves_through_the_thread(self):
+        mode, backend = self.make()
+        mode.enable()
+        mode.update("OPEN PALM", mouse_hand(), 640, 480, 10.0)
+        self.assertTrue(self.wait_for(lambda: backend.count("move") > 0))
+        mode.disable()
+
+    def test_driver_error_turns_mouse_mode_off(self):
+        backend = FakeBackend()
+
+        def boom(x, y):
+            raise RuntimeError("failsafe")
+        backend.move_to = boom
+        mode, _ = self.make(backend)
+        mode.enable()
+        mode.update("OPEN PALM", mouse_hand(), 640, 480, 10.0)
+        self.assertTrue(self.wait_for(lambda: mode.driver.error is not None))
+        message = mode.update("OPEN PALM", mouse_hand(), 640, 480, 10.1)
+        self.assertIsNotNone(message)
+        self.assertFalse(mode.on)
+
+    def test_can_be_enabled_again_after_an_error(self):
+        backend = FakeBackend()
+        good_move = backend.move_to
+
+        def boom(x, y):
+            raise RuntimeError("failsafe")
+        backend.move_to = boom
+        mode, _ = self.make(backend)
+        mode.enable()
+        mode.update("OPEN PALM", mouse_hand(), 640, 480, 10.0)
+        self.assertTrue(self.wait_for(lambda: mode.driver.error is not None))
+        mode.update("OPEN PALM", mouse_hand(), 640, 480, 10.1)
+        backend.move_to = good_move
+        ok, _ = mode.enable()
+        self.assertTrue(ok)
+        self.assertIsNone(mode.driver.error)
+        self.assertTrue(mode.driver.thread.is_alive())
+        mode.disable()
+
+    def test_cursor_lag_setting_reaches_the_driver(self):
+        mode, _ = self.make(tau=0.2)
+        mode.enable()
+        self.assertEqual(mode.driver.tau, 0.2)
+        mode.disable()
+
+    def test_button_is_released_when_mode_is_disabled_mid_drag(self):
+        mode, backend = self.make()
+        mode.enable()
+        for i in range(4):
+            mode.update("POINT", left_pinch_hand(), 640, 480, 10.0 + i * 0.03)
+        self.assertEqual(backend.count("down"), 1)
+        mode.disable()
+        self.assertEqual(backend.count("up"), 1)
 
 
 class TestPyAutoGuiBackend(unittest.TestCase):

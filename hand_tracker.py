@@ -23,6 +23,13 @@ Options:
   --camera N           which camera to use (1 if an iPhone grabs index 0)
   --width / --height   capture size (default 640x480)
   --profile            print where the time goes (ms per stage) every 2 seconds
+  --cursor-lag SEC     how quickly the real cursor chases your hand (default 0.04;
+                       lower = snappier but less smooth, higher = smoother but laggier)
+  --direct-cursor      move the cursor straight from each camera frame (old behavior)
+  --still-radius PX    cursor ignores wobbles smaller than this many screen pixels
+                       (default 8; raise it if the cursor shakes, 0 turns it off)
+  --click-lookback SEC clicks land where the cursor was this long before your fingers
+                       closed (default 0.2; raise it if clicks land past the target)
 
 Mouse mode needs:  pip install pyautogui
 On macOS also allow your terminal (Terminal, iTerm, VS Code...) under
@@ -96,10 +103,18 @@ PINCH_OFF = 0.40         # must open past this to release (hysteresis stops flic
 PINCH_FRAMES = 2         # consecutive pinched frames required before a click starts
 PINCH_MIN_REACH = 1.0    # index tip must be this far from the wrist (palm lengths), so a fist is not a click
 RIGHT_CLICK_COOLDOWN = 0.6
-CURSOR_MIN_ALPHA = 0.15  # smoothing when moving slowly (steady cursor)
-CURSOR_MAX_ALPHA = 0.7   # smoothing when moving fast (little lag)
-CURSOR_REF_DIST = 0.12   # normalized distance at which smoothing is at its fastest
+ONE_EURO_MIN_CUTOFF = 1.0  # Hz: lower = steadier cursor when still (but more lag)
+ONE_EURO_BETA = 12.0       # higher = less lag when moving fast
+ONE_EURO_D_CUTOFF = 1.0    # Hz: smoothing of the speed estimate
+CURSOR_FOLLOW_TAU = 0.04   # seconds: how quickly the real cursor chases its target
+CURSOR_RATE_HZ = 120       # how often the cursor thread updates the real cursor
 CURSOR_DEADZONE_PX = 2   # ignore cursor moves smaller than this
+STILL_RADIUS_PX = 8      # cursor ignores wobbles smaller than this (screen pixels)
+PINCH_LOOKBACK = 0.20    # a click aims where the cursor was this many seconds earlier
+LOOKBACK_MAX_PX = 80     # ...but only if the cursor has not travelled farther than this since
+DRAG_START_PX = 14       # during a click the cursor stays locked until you move this far
+RELEASE_FREEZE = 0.15    # seconds the cursor stays put after you let go of a click
+RIGHT_CLICK_FREEZE = 0.4 # seconds the cursor stays put after a right click
 SCROLL_GAIN = 8.0        # scroll clicks per palm length of vertical hand movement
 SCROLL_DIRECTION = 1     # set to -1 if scrolling feels backwards
 MODE_TOGGLE_HOLD = 1.0   # seconds of THUMBS UP to switch mouse mode on/off
@@ -370,26 +385,44 @@ def to_pixels(u, v, screen_w, screen_h, pad=SCREEN_EDGE_PAD):
     return int(round(x)), int(round(y))
 
 
-class CursorSmoother:
-    """Adaptive smoothing: steady when you move slowly, responsive when you move fast."""
+class OneEuroFilter2D:
+    """The One Euro filter for a 2D pointer.
 
-    def __init__(self, min_alpha=CURSOR_MIN_ALPHA, max_alpha=CURSOR_MAX_ALPHA,
-                 ref_dist=CURSOR_REF_DIST):
-        self.min_alpha, self.max_alpha, self.ref_dist = min_alpha, max_alpha, ref_dist
-        self.pos = None
+    A standard way to smooth noisy tracking: it removes jitter when the hand is
+    nearly still and lets fast movements through with little lag. It uses real
+    timestamps, so it behaves the same at 15 fps and at 30 fps.
+    """
+
+    def __init__(self, min_cutoff=ONE_EURO_MIN_CUTOFF, beta=ONE_EURO_BETA,
+                 d_cutoff=ONE_EURO_D_CUTOFF):
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.reset()
 
     def reset(self):
-        self.pos = None
+        self.t = None
+        self.raw = None
+        self.x = None
+        self.dx = (0.0, 0.0)
 
-    def update(self, u, v):
-        if self.pos is None:
-            self.pos = (u, v)
-            return self.pos
-        d = math.hypot(u - self.pos[0], v - self.pos[1])
-        alpha = self.min_alpha + (self.max_alpha - self.min_alpha) * min(d / self.ref_dist, 1.0)
-        self.pos = (self.pos[0] + alpha * (u - self.pos[0]),
-                    self.pos[1] + alpha * (v - self.pos[1]))
-        return self.pos
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def update(self, u, v, t):
+        if self.x is None or self.t is None:
+            self.t, self.raw, self.x, self.dx = t, (u, v), (u, v), (0.0, 0.0)
+            return self.x
+        dt = max(t - self.t, 1e-3)
+        a_d = self._alpha(self.d_cutoff, dt)
+        raw_dx = ((u - self.raw[0]) / dt, (v - self.raw[1]) / dt)
+        self.dx = (self.dx[0] + a_d * (raw_dx[0] - self.dx[0]),
+                   self.dx[1] + a_d * (raw_dx[1] - self.dx[1]))
+        speed = math.hypot(*self.dx)
+        a = self._alpha(self.min_cutoff + self.beta * speed, dt)
+        self.x = (self.x[0] + a * (u - self.x[0]), self.x[1] + a * (v - self.x[1]))
+        self.t, self.raw = t, (u, v)
+        return self.x
 
 
 class PinchDetector:
@@ -500,29 +533,161 @@ class PyAutoGuiBackend:
         self.pg.scroll(clicks)
 
 
+class StillnessLeash:
+    """Ignores small wobbles so the cursor holds still when your hand does.
+
+    The output only moves once the input leaves a small circle around it, and
+    then it is pulled along at the edge of that circle. So there is no jump when
+    you start moving, and no shaking while you hold still.
+    """
+
+    def __init__(self, radius=STILL_RADIUS_PX):
+        self.radius = radius
+        self.anchor = None
+
+    def reset(self):
+        self.anchor = None
+
+    def set(self, px):
+        self.anchor = (float(px[0]), float(px[1]))
+
+    def update(self, px):
+        if self.anchor is None or self.radius <= 0:
+            self.anchor = (float(px[0]), float(px[1]))
+        else:
+            dx, dy = px[0] - self.anchor[0], px[1] - self.anchor[1]
+            d = math.hypot(dx, dy)
+            if d > self.radius:
+                k = (d - self.radius) / d
+                self.anchor = (self.anchor[0] + dx * k, self.anchor[1] + dy * k)
+        return int(round(self.anchor[0])), int(round(self.anchor[1]))
+
+
+class CursorDriver:
+    """Moves the real cursor smoothly between camera frames.
+
+    The camera only reports a new hand position 15-30 times a second, which
+    makes a cursor moved straight from those positions look choppy. This runs
+    on its own thread at ~120 Hz and glides the cursor toward the newest target
+    (an exponential chase), so motion looks continuous.
+    """
+
+    def __init__(self, backend, tau=CURSOR_FOLLOW_TAU, rate_hz=CURSOR_RATE_HZ):
+        self.backend = backend
+        self.tau = max(tau, 1e-3)
+        self.period = 1.0 / rate_hz
+        self.lock = threading.Lock()
+        self.target = None
+        self.pos = None
+        self.last_sent = None
+        self.running = False
+        self.thread = None
+        self.error = None
+
+    def reset(self):
+        with self.lock:
+            self.target = None
+            self.pos = None
+            self.last_sent = None
+        self.error = None
+
+    def set_target(self, px):
+        with self.lock:
+            self.target = (float(px[0]), float(px[1]))
+
+    def step(self, dt):
+        """Advance the cursor by dt seconds. Returns the new pixel position if it moved."""
+        with self.lock:
+            if self.target is None:
+                return None
+            if self.pos is None:
+                self.pos = self.target
+            else:
+                a = 1.0 - math.exp(-dt / self.tau)
+                self.pos = (self.pos[0] + a * (self.target[0] - self.pos[0]),
+                            self.pos[1] + a * (self.target[1] - self.pos[1]))
+            out = (int(round(self.pos[0])), int(round(self.pos[1])))
+            if out == self.last_sent:
+                return None
+            self.last_sent = out
+            self.backend.move_to(*out)
+        return out
+
+    def snap(self, px):
+        """Put the cursor exactly on px right now (used just before a click)."""
+        with self.lock:
+            self.target = (float(px[0]), float(px[1]))
+            self.pos = self.target
+            out = (int(round(px[0])), int(round(px[1])))
+            self.last_sent = out
+            self.backend.move_to(*out)
+        return out
+
+    def _run(self):
+        prev = time.perf_counter()
+        while self.running:
+            now = time.perf_counter()
+            dt, prev = now - prev, now
+            try:
+                self.step(dt)
+            except Exception as e:      # for example pyautogui's failsafe corner
+                self.error = e
+                self.running = False
+                return
+            time.sleep(self.period)
+
+    def start(self):
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.error = None
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+
+
 class MouseController:
     """Turns hand landmarks into mouse actions on a backend (real or fake)."""
 
-    def __init__(self, backend):
+    def __init__(self, backend, driver=None, still_radius=STILL_RADIUS_PX, lookback=PINCH_LOOKBACK):
         self.backend = backend
+        self.driver = driver      # if given, its thread does the actual cursor moving
+        self.lookback = lookback
         self.screen_w, self.screen_h = backend.size()
-        self.smoother = CursorSmoother()
+        self.smoother = OneEuroFilter2D()
+        self.leash = StillnessLeash(still_radius)
         self.left = PinchDetector()
         self.right = PinchDetector()
         self.left_down = False
         self.last_right_click = -1e9
         self.last_px = None
+        self.history = deque()    # (time, px) of recent cursor targets
+        self.click_lock = None    # where the current click was aimed; held until a drag starts
+        self.click_ref = None     # where the pointer was when the pinch closed (drag is measured from here)
+        self.freeze_until = 0.0
+        self.prev_scroll_y = None
+        self.scroll_accum = 0.0
+
+    def _forget_motion(self):
+        self.smoother.reset()
+        self.leash.reset()
+        self.last_px = None
+        self.history.clear()
+        self.click_lock = None
+        self.click_ref = None
+        self.freeze_until = 0.0
         self.prev_scroll_y = None
         self.scroll_accum = 0.0
 
     def reset(self):
         self.release_all()
-        self.smoother.reset()
         self.left.reset()
         self.right.reset()
-        self.last_px = None
-        self.prev_scroll_y = None
-        self.scroll_accum = 0.0
+        self._forget_motion()
 
     def release_all(self):
         """Never leave the mouse button held down."""
@@ -534,10 +699,42 @@ class MouseController:
         self.release_all()
         self.left.reset()
         self.right.reset()
-        self.smoother.reset()
-        self.last_px = None
-        self.prev_scroll_y = None
-        self.scroll_accum = 0.0
+        self._forget_motion()
+
+    def _lookback_point(self, now):
+        """Where the cursor was aimed `lookback` seconds ago, before your fingers started closing."""
+        if not self.history:
+            return None
+        wanted = now - self.lookback
+        point = self.history[0][1]
+        for t, px in self.history:
+            if t <= wanted:
+                point = px
+            else:
+                break
+        if dist(point, self.history[-1][1]) > LOOKBACK_MAX_PX:
+            return None           # the hand was moving fast: the current spot is the intended one
+        return point
+
+    def _aim(self, point):
+        """Put the cursor exactly on `point` right now."""
+        if point is None:
+            return
+        if self.driver is not None:
+            self.driver.snap(point)
+        elif point != self.last_px:
+            self.backend.move_to(*point)
+        self.last_px = point
+        self.leash.set(point)
+
+    def _send(self, px):
+        if self.driver is not None:
+            self.driver.set_target(px)
+            self.last_px = px
+        elif (self.last_px is None or abs(px[0] - self.last_px[0]) >= CURSOR_DEADZONE_PX
+                or abs(px[1] - self.last_px[1]) >= CURSOR_DEADZONE_PX):
+            self.backend.move_to(*px)
+            self.last_px = px
 
     def update(self, gesture, pts, frame_w, frame_h, now):
         palm = max(dist(pts[WRIST], pts[MIDDLE_MCP]), 1e-6)
@@ -545,20 +742,41 @@ class MouseController:
         index_ratio = dist(pts[THUMB_TIP], pts[INDEX_TIP]) / palm
         middle_ratio = dist(pts[THUMB_TIP], pts[MIDDLE_TIP]) / palm
 
+        # Pointer position: midpoint of thumb and index tips, smoothed every frame
+        mid = ((pts[THUMB_TIP][0] + pts[INDEX_TIP][0]) / 2,
+               (pts[THUMB_TIP][1] + pts[INDEX_TIP][1]) / 2)
+        u, v = map_to_screen(mid, frame_w, frame_h, self.screen_w, self.screen_h)
+        inst_px = to_pixels(u, v, self.screen_w, self.screen_h)      # unsmoothed: used to detect real movement
+        u, v = self.smoother.update(u, v, now)
+        raw_px = to_pixels(u, v, self.screen_w, self.screen_h)       # smoothed: where the cursor should go
+
         # Left button: pinch down / up (hold and move to drag)
         event = self.left.update(index_ratio, reach_ok)
         if event == "down" and not self.left_down:
+            # Closing your fingers nudges the pointer, so aim where it was just before.
+            point = self._lookback_point(now)
+            if point is None:
+                point = self.last_px
+            if point is not None:
+                self._aim(point)
+                self.click_lock = point
+                self.click_ref = inst_px
             self.backend.mouse_down()
             self.left_down = True
         elif event == "up":
             self.release_all()
+            if self.click_lock is not None:      # a plain click, not a drag
+                self.freeze_until = now + RELEASE_FREEZE
+                self.click_lock = None
 
         # Right click: thumb + middle finger, once per pinch
         if not self.left.active:
             event = self.right.update(middle_ratio, reach_ok)
             if event == "down" and now - self.last_right_click >= RIGHT_CLICK_COOLDOWN:
+                self._aim(self._lookback_point(now))
                 self.backend.click("right")
                 self.last_right_click = now
+                self.freeze_until = now + RIGHT_CLICK_FREEZE
         else:
             self.right.reset()
 
@@ -576,41 +794,59 @@ class MouseController:
             self.prev_scroll_y = None
             self.scroll_accum = 0.0
 
-        # Pointer: midpoint of thumb and index tips (stays put while you pinch).
-        # Frozen during FIST (pause), PEACE (scroll), and while a right-click pinch forms.
-        moving = (gesture not in ("FIST", "PEACE") or self.left.active) and not self.right.engaged
+        # Move the cursor. Frozen during FIST (pause), PEACE (scroll), a forming
+        # right-click pinch, and briefly after a click.
+        moving = ((gesture not in ("FIST", "PEACE") or self.left.active)
+                  and not self.right.engaged and now >= self.freeze_until)
         if moving:
-            mid = ((pts[THUMB_TIP][0] + pts[INDEX_TIP][0]) / 2,
-                   (pts[THUMB_TIP][1] + pts[INDEX_TIP][1]) / 2)
-            u, v = map_to_screen(mid, frame_w, frame_h, self.screen_w, self.screen_h)
-            u, v = self.smoother.update(u, v)
-            px = to_pixels(u, v, self.screen_w, self.screen_h)
-            if (self.last_px is None or abs(px[0] - self.last_px[0]) >= CURSOR_DEADZONE_PX
-                    or abs(px[1] - self.last_px[1]) >= CURSOR_DEADZONE_PX):
-                self.backend.move_to(*px)
-                self.last_px = px
+            # While a click is in progress the cursor stays on its target until your
+            # hand clearly moves away from where it was when the pinch closed. (Compared
+            # unsmoothed, so the smoothing filter catching up is not mistaken for a drag.)
+            if self.click_lock is not None and dist(inst_px, self.click_ref) > DRAG_START_PX:
+                self.click_lock = None
+            if self.click_lock is None:
+                px = self.leash.update(raw_px)
+                self.history.append((now, px))
+                while self.history and now - self.history[0][0] > 1.0:
+                    self.history.popleft()
+                self._send(px)
 
 
 class MouseMode:
     """Owns the on/off state of mouse mode and creates the backend on first use."""
 
-    def __init__(self, backend_factory=PyAutoGuiBackend):
+    def __init__(self, backend_factory=PyAutoGuiBackend, use_driver=False, tau=CURSOR_FOLLOW_TAU,
+                 still_radius=STILL_RADIUS_PX, lookback=PINCH_LOOKBACK):
         self.factory = backend_factory
+        self.use_driver = use_driver
+        self.tau = tau
+        self.still_radius = still_radius
+        self.lookback = lookback
         self.controller = None
+        self.driver = None
         self.on = False
 
     def enable(self):
         """Returns (ok, message)."""
         if self.controller is None:
             try:
-                self.controller = MouseController(self.factory())
+                backend = self.factory()
+                self.driver = CursorDriver(backend, tau=self.tau) if self.use_driver else None
+                self.controller = MouseController(backend, self.driver,
+                                                  still_radius=self.still_radius,
+                                                  lookback=self.lookback)
             except Exception as e:
                 return False, str(e)
         self.controller.reset()
+        if self.driver is not None:
+            self.driver.reset()
+            self.driver.start()
         self.on = True
         return True, "Mouse mode ON"
 
     def disable(self, message="Mouse mode OFF"):
+        if self.driver is not None:
+            self.driver.stop()
         if self.controller is not None:
             try:
                 self.controller.release_all()
@@ -626,6 +862,8 @@ class MouseMode:
 
     def update(self, gesture, pts, frame_w, frame_h, now):
         """Run one frame. Any backend error (failsafe corner, permissions) turns the mode off."""
+        if self.driver is not None and self.driver.error is not None:
+            return self.disable(f"Mouse mode OFF ({type(self.driver.error).__name__})")
         try:
             self.controller.update(gesture, pts, frame_w, frame_h, now)
         except Exception as e:
@@ -652,6 +890,14 @@ def main():
     ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--profile", action="store_true",
                     help="print average ms per stage every 2 seconds")
+    ap.add_argument("--cursor-lag", type=float, default=CURSOR_FOLLOW_TAU,
+                    help="seconds the real cursor takes to chase your hand (lower = snappier)")
+    ap.add_argument("--direct-cursor", action="store_true",
+                    help="move the cursor straight from each camera frame (old behavior)")
+    ap.add_argument("--still-radius", type=float, default=STILL_RADIUS_PX,
+                    help="ignore cursor wobbles smaller than this many screen pixels (0 = off)")
+    ap.add_argument("--click-lookback", type=float, default=PINCH_LOOKBACK,
+                    help="clicks land where the cursor was this many seconds before the pinch")
     args = ap.parse_args()
 
     ensure_model()
@@ -680,7 +926,8 @@ def main():
 
     smoother = GestureSmoother()
     drawing = DrawingCanvas()
-    mouse = MouseMode()
+    mouse = MouseMode(use_driver=not args.direct_cursor, tau=args.cursor_lag,
+                      still_radius=args.still_radius, lookback=args.click_lookback)
     hold = HoldDetector()
     pinch_smooth = 0.0
     prev_t = time.time()
